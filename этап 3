@@ -1,0 +1,440 @@
+Написан первый вариант кода,  с тремя датчика из четырех, код одноврменно показыввет 4 показателя, которые обновляются в реально времени, код для arduino, есть настройка для микрофона
+#include <Wire.h>
+#include <BH1750.h>
+#include "DHT.h"
+
+// =============================================
+// ПИНЫ ПОДКЛЮЧЕНИЯ ДАТЧИКОВ
+// =============================================
+
+// MAX9814 - микрофонный усилитель
+const int micPin = 34;      // OUT к GPIO34
+const int arPin = 32;       // AR к GPIO32
+const int gainPin = 33;     // GAIN к GPIO33
+
+// DHT22 - температура и влажность
+#define DHTPIN 4            // DATA к GPIO4
+#define DHTTYPE DHT22
+
+// BH1750 - освещенность (I2C)
+// SDA -> GPIO21, SCL -> GPIO22
+
+// =============================================
+// НАСТРОЙКИ И ПЕРЕМЕННЫЕ
+// =============================================
+
+// Настройки измерения шума
+const int sampleWindow = 50;    // время измерения в мс
+const float vRef = 3.3;         // напряжение питания
+
+// Калибровочные параметры шума
+float calibrationOffset = -30.0; // подбирается под вашу среду
+float currentDB = 0;
+
+// Переменные для данных
+float temperature;  // температура
+float humidity;     // влажность
+float lux;          // освещенность
+
+// Создаем объекты датчиков
+BH1750 lightMeter;
+DHT dht(DHTPIN, DHTTYPE);
+
+// =============================================
+// ФУНКЦИИ НАСТРОЙКИ
+// =============================================
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Инициализация всех датчиков
+  setupSensors();
+  
+  Serial.println("==========================================");
+  Serial.println("   ESP32 - КОМПЛЕКСНЫЙ МОНИТОРИНГ");
+  Serial.println("==========================================");
+  Serial.println("Датчики:");
+  Serial.println("- MAX9814: Уровень шума");
+  Serial.println("- DHT22: Температура и влажность");
+  Serial.println("- BH1750: Освещенность");
+  Serial.println();
+  Serial.println("Настройки MAX9814:");
+  Serial.println("- АРУ: Включено");
+  Serial.println("- Усиление: 50 дБ");
+  Serial.println("- Питание: 3.3V");
+  Serial.println();
+  
+  delay(3000);
+}
+
+void setupSensors() {
+  // Настройка MAX9814
+  pinMode(micPin, INPUT);
+  pinMode(arPin, OUTPUT);
+  pinMode(gainPin, OUTPUT);
+  setupMAX9814();
+  
+  // Настройка ADC ESP32
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  
+  // Инициализация I2C для BH1750
+  Wire.begin();
+  
+  // Настройка DHT22
+  pinMode(DHTPIN, INPUT_PULLUP);
+  dht.begin();
+  
+  // Инициализация датчика освещенности
+  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+}
+
+void setupMAX9814() {
+  // Включить АРУ (Auto Range)
+  digitalWrite(arPin, HIGH);
+  
+  // Установить усиление 50dB (оптимально для помещений)
+  setGain(50);
+}
+
+void setGain(int gainDB) {
+  switch(gainDB) {
+    case 40:
+      digitalWrite(gainPin, LOW);
+      Serial.println("Усиление установлено: 40 дБ");
+      break;
+    case 50:
+      digitalWrite(gainPin, HIGH);
+      Serial.println("Усиление установлено: 50 дБ");
+      break;
+    case 60:
+      pinMode(gainPin, INPUT);
+      Serial.println("Усиление установлено: 60 дБ");
+      break;
+  }
+}
+
+// =============================================
+// ФУНКЦИИ ИЗМЕРЕНИЯ ШУМА
+// =============================================
+
+float measureSoundLevelDB() {
+  unsigned long startMillis = millis();
+  unsigned int signalMax = 0;
+  unsigned int signalMin = 4095;
+  
+  // Сбор семплов в течение заданного времени
+  while (millis() - startMillis < sampleWindow) {
+    unsigned int sample = analogRead(micPin);
+    
+    if (sample < 4095) {  // Игнорируем значения насыщения
+      if (sample > signalMax) {
+        signalMax = sample;
+      }
+      if (sample < signalMin) {
+        signalMin = sample;
+      }
+    }
+  }
+  
+  // Расчет размаха сигнала (peak-to-peak)
+  unsigned int peakToPeak = signalMax - signalMin;
+  
+  // Конвертация в напряжение
+  float voltage = (peakToPeak * vRef) / 4095.0;
+  
+  // Конвертация в дБ
+  float db = 20.0 * log10(voltage) + 94 + calibrationOffset;
+  
+  return db;
+}
+
+// Скользящее среднее для сглаживания показаний шума
+const int avgSamples = 10;
+float dbReadings[avgSamples];
+int readIndex = 0;
+float total = 0;
+
+float movingAverage(float newReading) {
+  total = total - dbReadings[readIndex];
+  dbReadings[readIndex] = newReading;
+  total = total + dbReadings[readIndex];
+  
+  readIndex = (readIndex + 1) % avgSamples;
+  
+  return total / avgSamples;
+}
+
+String classifyNoiseLevel(float db) {
+  if (db < 30) return "💤 Очень тихо";
+  else if (db < 40) return "🔇 Тихая комната";
+  else if (db < 50) return "👥 Тихий разговор";
+  else if (db < 60) return "💬 Обычный разговор";
+  else if (db < 70) return "📢 Громкий разговор";
+  else if (db < 80) return "⚠️  Шумно";
+  else if (db < 90) return "🚨 Очень шумно";
+  else return "🔥 ОПАСНЫЙ УРОВЕНЬ!";
+}
+
+// =============================================
+// ФУНКЦИИ ИЗМЕРЕНИЯ ТЕМПЕРАТУРЫ И ВЛАЖНОСТИ
+// =============================================
+
+void readTemperatureHumidity() {
+  humidity = dht.readHumidity();
+  temperature = dht.readTemperature();
+}
+
+String getComfortLevel(float humidity) {
+  if (humidity < 30) return "Слишком сухо";
+  else if (humidity < 60) return "Нормально";
+  else if (humidity < 80) return "Повышенная влажность";
+  else return "Очень влажно";
+}
+
+// =============================================
+// ФУНКЦИИ ИЗМЕРЕНИЯ ОСВЕЩЕННОСТИ
+// =============================================
+
+void readLightLevel() {
+  lux = lightMeter.readLightLevel();
+}
+
+String getLightDescription(float lux) {
+  if (lux < 1) return "Очень темно (ночь)";
+  else if (lux < 10) return "Темно (сумерки)";
+  else if (lux < 50) return "Тускло (неяркая лампа)";
+  else if (lux < 200) return "Нормально (комната)";
+  else if (lux < 500) return "Ярко (офис)";
+  else if (lux < 1000) return "Очень ярко (магазин)";
+  else return "Ослепительно (солнце)";
+}
+
+// =============================================
+// ВЫВОД РЕЗУЛЬТАТОВ
+// =============================================
+
+void displayAllResults(float noiseDB, float temp, float hum, float light) {
+  Serial.println("════════════════════════════════════════════");
+  Serial.println("           КОМПЛЕКСНЫЙ МОНИТОРИНГ");
+  Serial.println("════════════════════════════════════════════");
+  
+  // Уровень шума
+  Serial.println("🔊 УРОВЕНЬ ШУМА:");
+  Serial.print("   ");
+  Serial.print(noiseDB, 1);
+  Serial.print(" дБ - ");
+  Serial.println(classifyNoiseLevel(noiseDB));
+  
+  // Визуальный индикатор уровня шума
+  Serial.print("   [");
+  int bars = map(constrain(noiseDB, 30, 100), 30, 100, 1, 20);
+  for (int i = 0; i < bars; i++) Serial.print("█");
+  for (int i = bars; i < 20; i++) Serial.print(" ");
+  Serial.println("]");
+  
+  // Температура и влажность
+  Serial.println("🌡️  ТЕМПЕРАТУРА И ВЛАЖНОСТЬ:");
+  if (isnan(hum) || isnan(temp)) {
+    Serial.println("   ОШИБКА чтения DHT22!");
+  } else {
+    Serial.print("   Температура: ");
+    Serial.print(temp);
+    Serial.println(" °C");
+    
+    Serial.print("   Влажность:    ");
+    Serial.print(hum);
+    Serial.print(" % - ");
+    Serial.println(getComfortLevel(hum));
+  }
+  
+  // Освещенность
+  Serial.println("💡 ОСВЕЩЕННОСТЬ:");
+  if (lux >= 0) {
+    Serial.print("   Уровень: ");
+    Serial.print(lux);
+    Serial.print(" лк - ");
+    Serial.println(getLightDescription(lux));
+  } else {
+    Serial.println("   ОШИБКА чтения BH1750!");
+  }
+  
+  // Статус системы
+  Serial.println("🔧 СТАТУС СИСТЕМЫ:");
+  Serial.println(!isnan(hum) && !isnan(temp) ? "   ✓ DHT22 работает" : "   ✗ DHT22 ошибка");
+  Serial.println(lux >= 0 ? "   ✓ BH1750 работает" : "   ✗ BH1750 ошибка");
+  Serial.println("   ✓ MAX9814 работает");
+  
+  // Предупреждения
+  checkAlerts(noiseDB, temp, hum);
+  
+  Serial.println("════════════════════════════════════════════");
+  Serial.println();
+}
+
+void checkAlerts(float db, float temp, float hum) {
+  static unsigned long lastAlertTime = 0;
+  bool alert = false;
+  
+  if (db > 75) {
+    Serial.println("🚨 ВНИМАНИЕ! Высокий уровень шума в комнате!");
+    alert = true;
+  }
+  
+  if (temp > 28) {
+    Serial.println("🌡️  ВНИМАНИЕ! Высокая температура!");
+    alert = true;
+  }
+  
+  if (hum < 30 || hum > 70) {
+    Serial.println("💧 ВНИМАНИЕ! Некомфортная влажность!");
+    alert = true;
+  }
+  
+  if (alert) {
+    lastAlertTime = millis();
+  }
+}
+
+// =============================================
+// КАЛИБРОВКА И СЕРВИСНЫЕ ФУНКЦИИ
+// =============================================
+
+void calibrateMicrophone() {
+  Serial.println();
+  Serial.println("🔧 КАЛИБРОВКА МИКРОФОНА");
+  Serial.println("Убедитесь, что в комнате ТИХО");
+  Serial.println("Нажмите любую клавишу для начала...");
+  while (!Serial.available()) {
+    delay(100);
+  }
+  Serial.read(); // Очищаем буфер
+  
+  Serial.println("Калибровка... Сохраняйте тишину 10 секунд");
+  
+  float sum = 0;
+  int measurements = 50;
+  
+  for (int i = 0; i < measurements; i++) {
+    float db = measureSoundLevelDB();
+    sum += db;
+    Serial.print(".");
+    delay(200);
+  }
+  
+  float averageLevel = sum / measurements;
+  calibrationOffset = 35.0 - averageLevel;
+  
+  Serial.println();
+  Serial.println("════════════════════════════");
+  Serial.print("Результат калибровки:");
+  Serial.print("Средний уровень в тишине: ");
+  Serial.print(averageLevel, 1);
+  Serial.println(" дБ");
+  Serial.print("Установлена коррекция: ");
+  Serial.print(calibrationOffset, 1);
+  Serial.println(" дБ");
+  Serial.println("════════════════════════════");
+  Serial.println();
+}
+
+void printStatistics() {
+  Serial.println();
+  Serial.println("📊 СТАТИСТИКА И ДИАПАЗОНЫ:");
+  Serial.println("Уровень шума:");
+  Serial.println("30-40 дБ - Очень тихо (библиотека)");
+  Serial.println("40-50 дБ - Тихий офис");
+  Serial.println("50-60 дБ - Обычный разговор");
+  Serial.println("60-70 дБ - Громкий разговор");
+  Serial.println("70-80 дБ - Шумно (пылесос)");
+  Serial.println("80+ дБ   - Очень шумно");
+  Serial.println();
+  Serial.println("Температура (комфорт):");
+  Serial.println("20-25°C - Оптимально");
+  Serial.println("25-28°C - Тепло");
+  Serial.println("28+°C   - Жарко");
+  Serial.println();
+  Serial.println("Влажность (комфорт):");
+  Serial.println("30-60%  - Оптимально");
+  Serial.println("<30%    - Слишком сухо");
+  Serial.println(">60%    - Повышенная влажность");
+  Serial.println();
+}
+
+// =============================================
+// ОСНОВНОЙ ЦИКЛ
+// =============================================
+
+void loop() {
+  // Измерение уровня шума
+  currentDB = measureSoundLevelDB();
+  float smoothedDB = movingAverage(currentDB);
+  
+  // Чтение температуры и влажности
+  readTemperatureHumidity();
+  
+  // Чтение освещенности
+  readLightLevel();
+  
+  // Вывод всех результатов
+  displayAllResults(smoothedDB, temperature, humidity, lux);
+  
+  // Задержка между измерениями
+  delay(5000); // 5 секунд между измерениями
+}
+
+// =============================================
+// ОБРАБОТКА КОМАНД ЧЕРЕЗ SERIAL MONITOR
+// =============================================
+
+void serialEvent() {
+  if (Serial.available()) {
+    char command = Serial.read();
+    
+    switch(command) {
+      case 'c':
+        calibrateMicrophone();
+        break;
+      case 's':
+        printStatistics();
+        break;
+      case '4':
+        setGain(40);
+        break;
+      case '5':
+        setGain(50);
+        break;
+      case '6':
+        setGain(60);
+        break;
+      case 'a':
+        digitalWrite(arPin, !digitalRead(arPin));
+        Serial.println(digitalRead(arPin) ? "АРУ включено" : "АРУ выключено");
+        break;
+      case 'q':
+        // Быстрый тест
+        Serial.println("⚡ БЫСТРЫЙ ТЕСТ:");
+        Serial.print("Шум: ");
+        Serial.print(currentDB, 1);
+        Serial.print("дБ, Т: ");
+        Serial.print(temperature);
+        Serial.print("°C, В: ");
+        Serial.print(humidity);
+        Serial.print("%, Свет: ");
+        Serial.print(lux);
+        Serial.println(" лк");
+        break;
+      case '?':
+        Serial.println();
+        Serial.println("🔧 КОМАНДЫ СИСТЕМЫ:");
+        Serial.println("c - Калибровка микрофона");
+        Serial.println("s - Статистика и диапазоны");
+        Serial.println("4/5/6 - Усиление 40/50/60 дБ");
+        Serial.println("a - Вкл/Выкл АРУ");
+        Serial.println("q - Быстрый тест");
+        Serial.println("? - Справка по командам");
+        Serial.println();
+        break;
+    }
+  }
+}
